@@ -1,0 +1,14 @@
+# requirements.txt
+torch
+numpy
+scipy
+matplotlib
+lightning
+h5py
+tqdm
+
+# Optional: Spectral solver
+# dedalus>=3.0.0
+
+# Fallback solver
+numba

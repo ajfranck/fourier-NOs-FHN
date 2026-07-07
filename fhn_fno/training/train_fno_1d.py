@@ -11,10 +11,7 @@ from tqdm import tqdm
 import time
 from typing import Optional
 
-# had copilot do my logging (not bad)
-
-# new autocast import based on pytorch ver (it was breaking before)
-# idk what this even really does I just copied it and it works now
+# amp import location changed between torch versions
 try:
     from torch.cuda.amp import GradScaler, autocast
 
@@ -86,12 +83,10 @@ def train_epoch(
 
         if config.use_amp and device != "cpu" and LEGACY_AMP is not None:
             if LEGACY_AMP:
-                # old PyTorch API
                 with autocast():
                     pred = model(x)
                     loss = criterion(pred, y)
             else:
-                # new PyTorch API
                 with autocast("cuda"):
                     pred = model(x)
                     loss = criterion(pred, y)
@@ -184,7 +179,6 @@ def train(
     target_loss: float = None,
 ):
 
-    # override if we give args
     if device:
         config.training.device = device
     if checkpoint_dir:
@@ -196,14 +190,6 @@ def train(
 
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
-
-    # logging since it wasnt working lol
-    if target_loss is not None:
-        print(f"\ntraining until validation loss reaches {target_loss:.4f}")
-        print(f"   (or until max {config.training.epochs} epochs)")
-    else:
-        print(f"\ntraining for {config.training.epochs} epochs")
-    print()
 
     train_dataset = FHNOperatorDataset(
         data_file, mode="single_step", train=True, device="cpu"
@@ -304,7 +290,7 @@ def train(
 
             if target_loss is not None and val_loss <= target_loss:
                 print(
-                    f"\n Target loss of {target_loss:.4f} reached! "
+                    f"\n🎯 Target loss of {target_loss:.4f} reached! "
                     f"Current val loss: {val_loss:.4f}"
                 )
                 print(f"Stopping training at epoch {epoch}")
@@ -333,7 +319,7 @@ def train(
                         "val_loss": val_loss,
                         "config": config.to_dict(),
                     },
-                    checkpoint_dir / "best_model_simple_16000training.pt",
+                    checkpoint_dir / "best_model.pt",
                 )
             else:
                 patience_counter += 1
@@ -364,15 +350,13 @@ def train(
 
 
 def main():
-    DATA_FILE = "data/fhn_1d_16000.h5"
+    DATA_FILE = "data/fhn_1d_128.h5"
     EPOCHS = 1000
     BATCH_SIZE = 32
-    LEARNING_RATE = 1e-5
+    LEARNING_RATE = 1e-3
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     CHECKPOINT_DIR = "checkpoints/"
-    TARGET_LOSS = 0.00001
-    # goated for good numbers
-    # TARGET_LOSS = 0.0001
+    TARGET_LOSS = 0.01
 
     print(f"PyTorch version: {torch.__version__}")
     print(f"CUDA available: {torch.cuda.is_available()}")
@@ -385,7 +369,15 @@ def main():
     if LEARNING_RATE:
         config.training.lr = LEARNING_RATE
 
+    # FNO uses complex ops, which break under half precision
     config.training.use_amp = False
+
+    if LEGACY_AMP is None:
+        print("Warning: AMP not available, using regular precision")
+    elif config.training.use_amp:
+        print("Mixed precision training enabled")
+    else:
+        print("Regular precision training")
 
     train(config, DATA_FILE, DEVICE, CHECKPOINT_DIR, EPOCHS, TARGET_LOSS)
 

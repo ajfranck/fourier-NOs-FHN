@@ -3,11 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 
-# note: remove the param conditioning it is useless, that paper was pointless
-
 
 class SpectralConv1d(nn.Module):
-
+    
     def __init__(self, in_channels: int, out_channels: int, modes: int):
         super().__init__()
         self.in_channels = in_channels
@@ -15,25 +13,22 @@ class SpectralConv1d(nn.Module):
         self.modes = modes
 
         scale = 1 / (in_channels * out_channels)
-        self.weights = nn.Parameter(
-            scale * torch.randn(in_channels, out_channels, modes, dtype=torch.cfloat)
-        )
+        self.weights = nn.Parameter(scale * torch.randn(
+            in_channels, out_channels, modes, dtype=torch.cfloat
+        ))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, _, nx = x.shape
 
-        # FFT
         x_ft = torch.fft.rfft(x, dim=-1)
 
-        out_ft = torch.zeros(
-            batch_size,
-            self.out_channels,
-            nx // 2 + 1,
-            dtype=torch.cfloat,
-            device=x.device,
-        )
-        out_ft[:, :, : self.modes] = torch.einsum(
-            "bix,iox->box", x_ft[:, :, : self.modes], self.weights
+        # keep only the lowest modes
+        out_ft = torch.zeros(batch_size, self.out_channels, nx // 2 + 1,
+                            dtype=torch.cfloat, device=x.device)
+        out_ft[:, :, :self.modes] = torch.einsum(
+            "bix,iox->box",
+            x_ft[:, :, :self.modes],
+            self.weights
         )
 
         out = torch.fft.irfft(out_ft, n=nx, dim=-1)
@@ -42,7 +37,7 @@ class SpectralConv1d(nn.Module):
 
 
 class SpectralConv2d(nn.Module):
-
+    
     def __init__(self, in_channels: int, out_channels: int, modes1: int, modes2: int):
         super().__init__()
         self.in_channels = in_channels
@@ -51,35 +46,33 @@ class SpectralConv2d(nn.Module):
         self.modes2 = modes2
 
         scale = 1 / (in_channels * out_channels)
-        self.weights1 = nn.Parameter(
-            scale
-            * torch.randn(in_channels, out_channels, modes1, modes2, dtype=torch.cfloat)
-        )
-        self.weights2 = nn.Parameter(
-            scale
-            * torch.randn(in_channels, out_channels, modes1, modes2, dtype=torch.cfloat)
-        )
-
+        self.weights1 = nn.Parameter(scale * torch.randn(
+            in_channels, out_channels, modes1, modes2, dtype=torch.cfloat
+        ))
+        self.weights2 = nn.Parameter(scale * torch.randn(
+            in_channels, out_channels, modes1, modes2, dtype=torch.cfloat
+        ))
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, _, nx, ny = x.shape
 
         x_ft = torch.fft.rfft2(x, dim=(-2, -1))
 
-        out_ft = torch.zeros(
-            batch_size,
-            self.out_channels,
-            nx,
-            ny // 2 + 1,
-            dtype=torch.cfloat,
-            device=x.device,
+        out_ft = torch.zeros(batch_size, self.out_channels, nx, ny // 2 + 1,
+                            dtype=torch.cfloat, device=x.device)
+
+        # positive x frequencies
+        out_ft[:, :, :self.modes1, :self.modes2] = torch.einsum(
+            "bixy,ioxy->boxy",
+            x_ft[:, :, :self.modes1, :self.modes2],
+            self.weights1
         )
 
-        out_ft[:, :, : self.modes1, : self.modes2] = torch.einsum(
-            "bixy,ioxy->boxy", x_ft[:, :, : self.modes1, : self.modes2], self.weights1
-        )
-
-        out_ft[:, :, -self.modes1 :, : self.modes2] = torch.einsum(
-            "bixy,ioxy->boxy", x_ft[:, :, -self.modes1 :, : self.modes2], self.weights2
+        # negative-frequency block in x
+        out_ft[:, :, -self.modes1:, :self.modes2] = torch.einsum(
+            "bixy,ioxy->boxy",
+            x_ft[:, :, -self.modes1:, :self.modes2],
+            self.weights2
         )
 
         out = torch.fft.irfft2(out_ft, s=(nx, ny), dim=(-2, -1))
@@ -88,13 +81,14 @@ class SpectralConv2d(nn.Module):
 
 
 class FourierLayer(nn.Module):
+    """Spectral conv + pointwise conv, with norm and a learnable residual."""
 
     def __init__(self, width: int, modes: int, dim: int = 1):
         super().__init__()
         self.width = width
         self.modes = modes
         self.dim = dim
-
+        
         if dim == 1:
             self.spectral = SpectralConv1d(width, width, modes)
             self.w = nn.Conv1d(width, width, 1)
@@ -125,11 +119,12 @@ class FourierLayer(nn.Module):
 
 
 class ParameterEncoder(nn.Module):
+    """Maps PDE parameters to a conditioning vector."""
 
     def __init__(self, n_params: int, width: int, hidden_dim: Optional[int] = None):
         super().__init__()
         hidden_dim = hidden_dim or width * 2
-
+        
         self.encoder = nn.Sequential(
             nn.Linear(n_params, hidden_dim),
             nn.GELU(),
@@ -137,28 +132,20 @@ class ParameterEncoder(nn.Module):
             nn.Linear(hidden_dim, width),
             nn.GELU(),
             nn.Linear(width, width),
-            nn.LayerNorm(width),
+            nn.LayerNorm(width)
         )
-
+        
     def forward(self, params: torch.Tensor) -> torch.Tensor:
         return self.encoder(params)
 
 
 class FNO(nn.Module):
+    """FNO with residual connections and FiLM parameter conditioning."""
 
-    def __init__(
-        self,
-        modes: int = 16,
-        width: int = 64,
-        n_layers: int = 4,
-        in_channels: int = 2,
-        out_channels: int = 2,
-        dim: int = 1,
-        use_positional: bool = False,
-        use_param_conditioning: bool = True,
-        n_params: int = 5,
-    ):
-
+    def __init__(self, modes: int = 16, width: int = 64, n_layers: int = 4,
+                 in_channels: int = 2, out_channels: int = 2, dim: int = 1,
+                 use_positional: bool = False, use_param_conditioning: bool = True,
+                 n_params: int = 5):
         super().__init__()
         self.modes = modes
         self.width = width
@@ -171,47 +158,52 @@ class FNO(nn.Module):
 
         if use_param_conditioning:
             self.param_encoder = ParameterEncoder(n_params, width)
-            self.param_film_gamma = nn.ModuleList(
-                [nn.Linear(width, width) for _ in range(n_layers)]
-            )
-            self.param_film_beta = nn.ModuleList(
-                [nn.Linear(width, width) for _ in range(n_layers)]
-            )
+            self.param_film_gamma = nn.ModuleList([
+                nn.Linear(width, width) for _ in range(n_layers)
+            ])
+            self.param_film_beta = nn.ModuleList([
+                nn.Linear(width, width) for _ in range(n_layers)
+            ])
 
+        # positional encoding adds one channel per spatial dim
         lift_in_channels = in_channels + dim if use_positional else in_channels
 
         if dim == 1:
             self.lift = nn.Sequential(
                 nn.Conv1d(lift_in_channels, width * 2, 1),
                 nn.GELU(),
-                nn.Conv1d(width * 2, width, 1),
+                nn.Conv1d(width * 2, width, 1)
             )
             self.projection = nn.Sequential(
-                nn.Conv1d(width, width, 1), nn.GELU(), nn.Conv1d(width, out_channels, 1)
+                nn.Conv1d(width, width, 1),
+                nn.GELU(),
+                nn.Conv1d(width, out_channels, 1)
             )
         elif dim == 2:
             self.lift = nn.Sequential(
                 nn.Conv2d(lift_in_channels, width * 2, 1),
                 nn.GELU(),
-                nn.Conv2d(width * 2, width, 1),
+                nn.Conv2d(width * 2, width, 1)
             )
             self.projection = nn.Sequential(
-                nn.Conv2d(width, width, 1), nn.GELU(), nn.Conv2d(width, out_channels, 1)
+                nn.Conv2d(width, width, 1),
+                nn.GELU(),
+                nn.Conv2d(width, out_channels, 1)
             )
         else:
             raise ValueError(f"Unsupported dimension: {dim}")
 
-        self.fourier_layers = nn.ModuleList(
-            [FourierLayer(width, modes, dim) for _ in range(n_layers)]
-        )
+        self.fourier_layers = nn.ModuleList([
+            FourierLayer(width, modes, dim) for _ in range(n_layers)
+        ])
 
         self.global_residual = nn.Parameter(torch.ones(1) * 0.1)
 
-    def forward(
-        self, x: torch.Tensor, params: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, params: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """One time step: (u, v) -> (u, v). params is (batch, 5) ordered [Du, Dv, a, b, tau]."""
         batch_size = x.shape[0]
 
+        # keep for the global skip
         input_x = x.clone()
 
         if self.use_positional:
@@ -231,17 +223,18 @@ class FNO(nn.Module):
         x = self.lift(x)
 
         if self.use_param_conditioning and params is not None:
-            param_features = self.param_encoder(params)  # (batch, width)
+            param_features = self.param_encoder(params)
 
         for i, layer in enumerate(self.fourier_layers):
             if self.use_param_conditioning and params is not None:
                 gamma = self.param_film_gamma[i](param_features)
                 beta = self.param_film_beta[i](param_features)
 
+                # broadcast over spatial dims
                 if self.dim == 1:
                     gamma = gamma.unsqueeze(-1)
                     beta = beta.unsqueeze(-1)
-                else:
+                else:  # dim == 2
                     gamma = gamma.unsqueeze(-1).unsqueeze(-1)
                     beta = beta.unsqueeze(-1).unsqueeze(-1)
 
@@ -256,14 +249,51 @@ class FNO(nn.Module):
 
         return x
 
-    def rollout(
-        self, x0: torch.Tensor, n_steps: int, params: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+    def rollout(self, x0: torch.Tensor, n_steps: int,
+                params: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Autoregressive rollout, returns (batch, n_steps+1, 2, *spatial)."""
         trajectory = [x0]
         x = x0
-
+        
         for _ in range(n_steps):
             x = self.forward(x, params)
             trajectory.append(x)
-
+        
         return torch.stack(trajectory, dim=1)
+
+
+def compute_fhn_pde_residual(u: torch.Tensor, v: torch.Tensor,
+                             u_next: torch.Tensor, v_next: torch.Tensor,
+                             params: dict, dt: float = 0.01, dx: float = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    """FHN PDE residuals for a physics-informed loss."""
+    if dx is None:
+        dx = 1.0 / u.shape[-1]
+
+    u_t = (u_next - u) / dt
+    v_t = (v_next - v) / dt
+
+    # central differences, periodic BCs via roll
+    if len(u.shape) == 2:  # 1D
+        u_xx = (torch.roll(u, 1, dims=-1) - 2*u + torch.roll(u, -1, dims=-1)) / (dx**2)
+        v_xx = (torch.roll(v, 1, dims=-1) - 2*v + torch.roll(v, -1, dims=-1)) / (dx**2)
+    else:  # 2D
+        u_xx = (torch.roll(u, 1, dims=-2) - 2*u + torch.roll(u, -1, dims=-2)) / (dx**2)
+        u_yy = (torch.roll(u, 1, dims=-1) - 2*u + torch.roll(u, -1, dims=-1)) / (dx**2)
+        u_lap = u_xx + u_yy
+        
+        v_xx = (torch.roll(v, 1, dims=-2) - 2*v + torch.roll(v, -1, dims=-2)) / (dx**2)
+        v_yy = (torch.roll(v, 1, dims=-1) - 2*v + torch.roll(v, -1, dims=-1)) / (dx**2)
+        v_lap = v_xx + v_yy
+
+    u_reaction = u - u**3/3 - v
+    v_reaction = (u + params.get('a', 0.0) - params.get('b', 0.2) * v) / params.get('tau', 5.0)
+
+    # residual of u_t = Du * u_xx + reaction
+    if len(u.shape) == 2:
+        u_residual = u_t - params.get('Du', 0.05) * u_xx - u_reaction
+        v_residual = v_t - params.get('Dv', 0.01) * v_xx - v_reaction
+    else:
+        u_residual = u_t - params.get('Du', 0.05) * u_lap - u_reaction
+        v_residual = v_t - params.get('Dv', 0.01) * v_lap - v_reaction
+    
+    return u_residual, v_residual

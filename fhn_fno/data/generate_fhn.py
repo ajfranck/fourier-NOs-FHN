@@ -1,52 +1,35 @@
 import numpy as np
 import h5py
-from typing import Tuple, Optional, Dict, Any
+import torch
+from typing import Tuple, Optional, Dict, Any, Union
 from abc import ABC, abstractmethod
 from tqdm import tqdm
 import sys
-
-sys.path.append(".")
+sys.path.append('.')
 
 from fhn_fno.config import FHNParams, DataConfig
 
 
 class PDESolver(ABC):
-
+    
     @abstractmethod
-    def solve(
-        self,
-        u0: np.ndarray,
-        v0: np.ndarray,
-        params: FHNParams,
-        T: float,
-        dt: float,
-        n_save: int,
-        I_ext: Optional[np.ndarray] = None,
-    ) -> Dict[str, np.ndarray]:
+    def solve(self, u0: np.ndarray, v0: np.ndarray, params: FHNParams,
+              T: float, dt: float, n_save: int, I_ext: Optional[np.ndarray] = None) -> Dict[str, np.ndarray]:
         pass
 
 
 class FDBackend(PDESolver):
+    """Finite difference solver, semi-implicit in time."""
 
-    def __init__(
-        self, nx: int, ny: Optional[int] = None, dx: float = 1.0, dy: float = 1.0
-    ):
+    def __init__(self, nx: int, ny: Optional[int] = None, dx: float = 1.0, dy: float = 1.0):
         self.nx = nx
         self.ny = ny
         self.dx = dx
         self.dy = dy
         self.dim = 1 if ny is None else 2
-
-    def solve(
-        self,
-        u0: np.ndarray,
-        v0: np.ndarray,
-        params: FHNParams,
-        T: float,
-        dt: float,
-        n_save: int,
-        I_ext: Optional[np.ndarray] = None,
-    ) -> Dict[str, np.ndarray]:
+        
+    def solve(self, u0: np.ndarray, v0: np.ndarray, params: FHNParams,
+              T: float, dt: float, n_save: int, I_ext: Optional[np.ndarray] = None) -> Dict[str, np.ndarray]:
         u, v = u0.copy(), v0.copy()
         n_steps = int(T / dt)
         save_interval = max(1, n_steps // n_save)
@@ -60,51 +43,54 @@ class FDBackend(PDESolver):
         else:
             lap = self._laplacian_2d(self.nx, self.ny, self.dx, self.dy)
 
+        # implicit diffusion, explicit reaction
         for step in range(n_steps):
             if self.dim == 1:
                 u_new = self._step_1d(u, v, params.Du, lap, dt, I_ext)
-                v_new = self._step_1d_v(
-                    u, v, params.Dv, params.a, params.b, params.tau, lap, dt
-                )
+                v_new = self._step_1d_v(u, v, params.Dv, params.a, params.b, params.tau, lap, dt)
             else:
                 u_flat = u.flatten()
                 v_flat = v.flatten()
                 I_flat = I_ext.flatten() if I_ext is not None else None
-
+                
                 u_new_flat = self._step_2d(u_flat, v_flat, params.Du, lap, dt, I_flat)
-                v_new_flat = self._step_2d_v(
-                    u_flat, v_flat, params.Dv, params.a, params.b, params.tau, lap, dt
-                )
-
+                v_new_flat = self._step_2d_v(u_flat, v_flat, params.Dv, params.a, params.b, params.tau, lap, dt)
+                
                 u_new = u_new_flat.reshape(u.shape)
                 v_new = v_new_flat.reshape(v.shape)
-
+            
             u, v = u_new, v_new
 
             if (step + 1) % save_interval == 0:
                 u_hist.append(u.copy())
                 v_hist.append(v.copy())
                 times.append((step + 1) * dt)
-
-        return {"u": np.array(u_hist), "v": np.array(v_hist), "t": np.array(times)}
-
+        
+        return {
+            'u': np.array(u_hist),
+            'v': np.array(v_hist),
+            't': np.array(times)
+        }
+    
     def _laplacian_1d(self, n: int, dx: float) -> np.ndarray:
+        # periodic BCs
         lap = np.zeros((n, n))
         c = 1.0 / (dx * dx)
-
+        
         for i in range(n):
             lap[i, i] = -2 * c
             lap[i, (i + 1) % n] = c
             lap[i, (i - 1) % n] = c
-
+            
         return lap
-
+    
     def _laplacian_2d(self, nx: int, ny: int, dx: float, dy: float) -> np.ndarray:
+        # periodic BCs, flattened row-major
         n = nx * ny
         lap = np.zeros((n, n))
         cx = 1.0 / (dx * dx)
         cy = 1.0 / (dy * dy)
-
+        
         for i in range(nx):
             for j in range(ny):
                 idx = i * ny + j
@@ -119,220 +105,289 @@ class FDBackend(PDESolver):
                 idx_down = i * ny + ((j - 1) % ny)
                 lap[idx, idx_up] = cy
                 lap[idx, idx_down] = cy
+                
+        return lap
+    
+    def _step_1d(self, u: np.ndarray, v: np.ndarray, Du: float, lap: np.ndarray, dt: float,
+                 I_ext: Optional[np.ndarray]) -> np.ndarray:
+        reaction = u - u**3/3 - v
+        if I_ext is not None:
+            reaction += I_ext
 
+        # (I - dt*Du*lap) u_new = u + dt*reaction
+        A = np.eye(len(u)) - dt * Du * lap
+        b = u + dt * reaction
+        u_new = np.linalg.solve(A, b)
+        
+        return u_new
+    
+    def _step_1d_v(self, u: np.ndarray, v: np.ndarray, Dv: float, a: float, b: float,
+                   tau: float, lap: np.ndarray, dt: float) -> np.ndarray:
+        reaction = (u + a - b * v) / tau
+
+        A = np.eye(len(v)) - dt * Dv * lap
+        b_vec = v + dt * reaction
+        v_new = np.linalg.solve(A, b_vec)
+        
+        return v_new
+    
+    def _step_2d(self, u: np.ndarray, v: np.ndarray, Du: float, lap: np.ndarray, dt: float,
+                 I_ext: Optional[np.ndarray]) -> np.ndarray:
+        # same as 1D but on flattened fields
+        reaction = u - u**3/3 - v
+        if I_ext is not None:
+            reaction += I_ext
+            
+        A = np.eye(len(u)) - dt * Du * lap
+        b = u + dt * reaction
+        u_new = np.linalg.solve(A, b)
+        
+        return u_new
+    
+    def _step_2d_v(self, u: np.ndarray, v: np.ndarray, Dv: float, a: float, b: float,
+                   tau: float, lap: np.ndarray, dt: float) -> np.ndarray:
+        reaction = (u + a - b * v) / tau
+        
+        A = np.eye(len(v)) - dt * Dv * lap
+        b_vec = v + dt * reaction
+        v_new = np.linalg.solve(A, b_vec)
+        
+        return v_new
+
+
+class FDBackendGPU:
+    """Torch port of FDBackend with batched rollouts, so solver timings are
+    comparable to the FNO on the same device."""
+
+    def __init__(self, nx: int, dx: float = 1.0, device: str = "cuda",
+                 dtype: torch.dtype = torch.float32):
+        self.nx = nx
+        self.dx = dx
+        self.dim = 1
+        self.device = device
+        self.dtype = dtype
+
+        self.lap = self._laplacian_1d(nx, dx).to(device=device, dtype=dtype)
+        self.I = torch.eye(nx, device=device, dtype=dtype)
+
+    def _laplacian_1d(self, n: int, dx: float) -> torch.Tensor:
+        lap = torch.zeros((n, n), dtype=self.dtype)
+        c = 1.0 / (dx * dx)
+        for i in range(n):
+            lap[i, i] = -2 * c
+            lap[i, (i + 1) % n] = c
+            lap[i, (i - 1) % n] = c
         return lap
 
-    def _step_1d(
-        self,
-        u: np.ndarray,
-        v: np.ndarray,
-        Du: float,
-        lap: np.ndarray,
-        dt: float,
-        I_ext: Optional[np.ndarray],
-    ) -> np.ndarray:
-        reaction = u - u**3 / 3 - v
+    @torch.no_grad()
+    def solve_batched(self, u0: torch.Tensor, v0: torch.Tensor,
+                      params: Union[FHNParams, torch.Tensor],
+                      T: float, dt: float, n_save: int,
+                      I_ext: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """params: shared FHNParams or per-sample (B, 5) tensor [Du, Dv, a, b, tau]."""
+        assert u0.ndim == 2 and v0.ndim == 2, "inputs must be (B, nx)"
+        B, nx = u0.shape
+        assert nx == self.nx, f"nx mismatch: solver={self.nx}, input={nx}"
+
+        n_steps = int(T / dt)
+        save_interval = max(1, n_steps // n_save)
+
+        shared_params = isinstance(params, FHNParams)
+        if shared_params:
+            Du = float(params.Du)
+            Dv = float(params.Dv)
+            a = float(params.a)
+            b = float(params.b)
+            tau = float(params.tau)
+            A_u = self.I - (dt * Du) * self.lap
+            A_v = self.I - (dt * Dv) * self.lap
+            LU_u, piv_u = torch.linalg.lu_factor(A_u)
+            LU_v, piv_v = torch.linalg.lu_factor(A_v)
+        else:
+            p = params.to(device=self.device, dtype=self.dtype)
+            Du = p[:, 0].view(B, 1, 1)
+            Dv = p[:, 1].view(B, 1, 1)
+            a = p[:, 2].view(B, 1)
+            b = p[:, 3].view(B, 1)
+            tau = p[:, 4].view(B, 1)
+            lap_b = self.lap.unsqueeze(0).expand(B, nx, nx)
+            I_b = self.I.unsqueeze(0).expand(B, nx, nx)
+            A_u = I_b - dt * Du * lap_b
+            A_v = I_b - dt * Dv * lap_b
+            LU_u, piv_u = torch.linalg.lu_factor(A_u)
+            LU_v, piv_v = torch.linalg.lu_factor(A_v)
+
+        u = u0.clone()
+        v = v0.clone()
+        u_hist = [u.clone()]
+        v_hist = [v.clone()]
+        times = [0.0]
+
+        for step in range(n_steps):
+            reaction_u = u - u ** 3 / 3.0 - v
+            if I_ext is not None:
+                reaction_u = reaction_u + I_ext
+            reaction_v = (u + a - b * v) / tau
+
+            rhs_u = u + dt * reaction_u
+            rhs_v = v + dt * reaction_v
+
+            if shared_params:
+                u_new = torch.linalg.lu_solve(LU_u, piv_u, rhs_u.T).T
+                v_new = torch.linalg.lu_solve(LU_v, piv_v, rhs_v.T).T
+            else:
+                u_new = torch.linalg.lu_solve(LU_u, piv_u, rhs_u.unsqueeze(-1)).squeeze(-1)
+                v_new = torch.linalg.lu_solve(LU_v, piv_v, rhs_v.unsqueeze(-1)).squeeze(-1)
+
+            u, v = u_new, v_new
+
+            if (step + 1) % save_interval == 0:
+                u_hist.append(u.clone())
+                v_hist.append(v.clone())
+                times.append((step + 1) * dt)
+
+        return {
+            "u": torch.stack(u_hist, dim=1),
+            "v": torch.stack(v_hist, dim=1),
+            "t": torch.tensor(times, device=self.device, dtype=self.dtype),
+        }
+
+    @torch.no_grad()
+    def solve(self, u0: np.ndarray, v0: np.ndarray, params: FHNParams,
+              T: float, dt: float, n_save: int,
+              I_ext: Optional[np.ndarray] = None) -> Dict[str, np.ndarray]:
+        """Single-trajectory numpy wrapper matching the FDBackend interface."""
+        if isinstance(u0, np.ndarray):
+            u0_t = torch.from_numpy(u0).to(self.device, self.dtype).unsqueeze(0)
+            v0_t = torch.from_numpy(v0).to(self.device, self.dtype).unsqueeze(0)
+        else:
+            u0_t = u0.unsqueeze(0) if u0.ndim == 1 else u0
+            v0_t = v0.unsqueeze(0) if v0.ndim == 1 else v0
+
+        I_ext_t = None
         if I_ext is not None:
-            reaction += I_ext
+            if isinstance(I_ext, np.ndarray):
+                I_ext_t = torch.from_numpy(I_ext).to(self.device, self.dtype).unsqueeze(0)
+            else:
+                I_ext_t = I_ext.unsqueeze(0) if I_ext.ndim == 1 else I_ext
 
-        A = np.eye(len(u)) - dt * Du * lap
-        b = u + dt * reaction
-        u_new = np.linalg.solve(A, b)
-
-        return u_new
-
-    def _step_1d_v(
-        self,
-        u: np.ndarray,
-        v: np.ndarray,
-        Dv: float,
-        a: float,
-        b: float,
-        tau: float,
-        lap: np.ndarray,
-        dt: float,
-    ) -> np.ndarray:
-        reaction = (u + a - b * v) / tau
-
-        A = np.eye(len(v)) - dt * Dv * lap
-        b_vec = v + dt * reaction
-        v_new = np.linalg.solve(A, b_vec)
-
-        return v_new
-
-    def _step_2d(
-        self,
-        u: np.ndarray,
-        v: np.ndarray,
-        Du: float,
-        lap: np.ndarray,
-        dt: float,
-        I_ext: Optional[np.ndarray],
-    ) -> np.ndarray:
-        reaction = u - u**3 / 3 - v
-        if I_ext is not None:
-            reaction += I_ext
-
-        A = np.eye(len(u)) - dt * Du * lap
-        b = u + dt * reaction
-        u_new = np.linalg.solve(A, b)
-
-        return u_new
-
-    def _step_2d_v(
-        self,
-        u: np.ndarray,
-        v: np.ndarray,
-        Dv: float,
-        a: float,
-        b: float,
-        tau: float,
-        lap: np.ndarray,
-        dt: float,
-    ) -> np.ndarray:
-        reaction = (u + a - b * v) / tau
-
-        A = np.eye(len(v)) - dt * Dv * lap
-        b_vec = v + dt * reaction
-        v_new = np.linalg.solve(A, b_vec)
-
-        return v_new
+        out = self.solve_batched(u0_t, v0_t, params, T, dt, n_save, I_ext_t)
+        return {
+            "u": out["u"].squeeze(0).cpu().numpy(),
+            "v": out["v"].squeeze(0).cpu().numpy(),
+            "t": out["t"].cpu().numpy(),
+        }
 
 
 class DedalusBackend(PDESolver):
-    # ended up not needing this / overdoing it
-    # dont mess with it
+    """Spectral backend placeholder, dedalus is not installed yet."""
 
     def __init__(self, nx: int, ny: Optional[int] = None):
         self.nx = nx
         self.ny = ny
-        raise NotImplementedError(
-            "Dedalus backend requires dedalus package. Use --backend=fallback"
-        )
-
-    def solve(
-        self,
-        u0: np.ndarray,
-        v0: np.ndarray,
-        params: FHNParams,
-        T: float,
-        dt: float,
-        n_save: int,
-        I_ext: Optional[np.ndarray] = None,
-    ) -> Dict[str, np.ndarray]:
+        raise NotImplementedError("Dedalus backend requires dedalus package. Use --backend=fallback")
+    
+    def solve(self, u0: np.ndarray, v0: np.ndarray, params: FHNParams,
+              T: float, dt: float, n_save: int, I_ext: Optional[np.ndarray] = None) -> Dict[str, np.ndarray]:
         pass
 
 
-def sample_initial_conditions(
-    nx: int,
-    ny: Optional[int],
-    ic_type: str = "grf",
-    alpha: float = 2.0,
-    seed: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
+def sample_initial_conditions(nx: int, ny: Optional[int], ic_type: str = "grf",
+                              alpha: float = 2.0, seed: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
+    """Sample random initial conditions for u and v."""
     if seed is not None:
         np.random.seed(seed)
 
     if ic_type == "grf":
-        if ny is None:
-            k = np.fft.fftfreq(nx, d=1.0 / nx)
-            k[0] = 1e-10
+        if ny is None:  # 1D
+            k = np.fft.fftfreq(nx, d=1.0/nx)
+            k[0] = 1e-10  # avoid divide by zero
 
-            power = (1 + np.abs(k) ** 2) ** (-alpha / 2)
+            power = (1 + np.abs(k)**2)**(-alpha/2)
             u_hat = np.random.randn(nx) + 1j * np.random.randn(nx)
             u_hat *= np.sqrt(power)
 
             v_hat = np.random.randn(nx) + 1j * np.random.randn(nx)
-            v_hat *= np.sqrt(power) * 0.5
+            v_hat *= np.sqrt(power) * 0.5  # smaller amplitude for v
 
             u0 = np.real(np.fft.ifft(u_hat))
             v0 = np.real(np.fft.ifft(v_hat))
-
-        else:  # 2d
-            kx = np.fft.fftfreq(nx, d=1.0 / nx)
-            ky = np.fft.fftfreq(ny, d=1.0 / ny)
-            kx, ky = np.meshgrid(kx, ky, indexing="ij")
+            
+        else:  # 2D
+            kx = np.fft.fftfreq(nx, d=1.0/nx)
+            ky = np.fft.fftfreq(ny, d=1.0/ny)
+            kx, ky = np.meshgrid(kx, ky, indexing='ij')
             k2 = kx**2 + ky**2
             k2[0, 0] = 1e-10
-
-            power = (1 + k2) ** (-alpha / 2)
+            
+            power = (1 + k2)**(-alpha/2)
             u_hat = np.random.randn(nx, ny) + 1j * np.random.randn(nx, ny)
             u_hat *= np.sqrt(power)
-
+            
             v_hat = np.random.randn(nx, ny) + 1j * np.random.randn(nx, ny)
             v_hat *= np.sqrt(power) * 0.5
-
+            
             u0 = np.real(np.fft.ifft2(u_hat))
             v0 = np.real(np.fft.ifft2(v_hat))
-
+    
     elif ic_type == "gaussian":
-        # gauss bump
-        if ny is None:
+        if ny is None:  # 1D
             x = np.linspace(0, 1, nx, endpoint=False)
             x0 = np.random.uniform(0.3, 0.7)
             sigma = np.random.uniform(0.05, 0.15)
-            u0 = np.exp(-((x - x0) ** 2) / (2 * sigma**2))
+            u0 = np.exp(-((x - x0)**2) / (2 * sigma**2))
             v0 = 0.5 * u0 + 0.1 * np.random.randn(nx)
-        else:
+        else:  # 2D
             x = np.linspace(0, 1, nx, endpoint=False)
             y = np.linspace(0, 1, ny, endpoint=False)
-            xx, yy = np.meshgrid(x, y, indexing="ij")
+            xx, yy = np.meshgrid(x, y, indexing='ij')
             x0, y0 = np.random.uniform(0.3, 0.7, 2)
             sigma = np.random.uniform(0.05, 0.15)
-            u0 = np.exp(-((xx - x0) ** 2 + (yy - y0) ** 2) / (2 * sigma**2))
+            u0 = np.exp(-((xx - x0)**2 + (yy - y0)**2) / (2 * sigma**2))
             v0 = 0.5 * u0 + 0.1 * np.random.randn(nx, ny)
-
+    
     elif ic_type == "sinusoidal":
-        # sin perturb
-        if ny is None:
-            x = np.linspace(0, 2 * np.pi, nx, endpoint=False)
+        if ny is None:  # 1D
+            x = np.linspace(0, 2*np.pi, nx, endpoint=False)
             k1, k2 = np.random.randint(1, 5, 2)
             u0 = 0.5 * (np.sin(k1 * x) + np.sin(k2 * x))
             v0 = 0.3 * np.cos(k1 * x)
-        else:
-            x = np.linspace(0, 2 * np.pi, nx, endpoint=False)
-            y = np.linspace(0, 2 * np.pi, ny, endpoint=False)
-            xx, yy = np.meshgrid(x, y, indexing="ij")
+        else:  # 2D
+            x = np.linspace(0, 2*np.pi, nx, endpoint=False)
+            y = np.linspace(0, 2*np.pi, ny, endpoint=False)
+            xx, yy = np.meshgrid(x, y, indexing='ij')
             kx, ky = np.random.randint(1, 4, 2)
             u0 = 0.5 * np.sin(kx * xx) * np.cos(ky * yy)
             v0 = 0.3 * np.cos(kx * xx) * np.sin(ky * yy)
-
+    
     else:
         raise ValueError(f"Unknown IC type: {ic_type}")
 
     u0 = (u0 - np.mean(u0)) / (np.std(u0) + 1e-8)
     v0 = (v0 - np.mean(v0)) / (np.std(v0) + 1e-8)
-
+    
     return u0, v0
 
 
 def sample_parameters(config: DataConfig, seed: Optional[int] = None) -> FHNParams:
     if seed is not None:
         np.random.seed(seed)
-
+    
     return FHNParams(
         Du=np.random.uniform(*config.Du_range),
         Dv=np.random.uniform(*config.Dv_range),
         a=np.random.uniform(*config.a_range),
         b=np.random.uniform(*config.b_range),
-        tau=np.random.uniform(*config.tau_range),
+        tau=np.random.uniform(*config.tau_range)
     )
 
 
-def generate_dataset(
-    config: DataConfig,
-    n_samples: int,
-    backend: str = "fallback",
-    output_file: str = "fhn_data.h5",
-    verbose: bool = True,
-):
+def generate_dataset(config: DataConfig, n_samples: int, backend: str = "fallback",
+                     output_file: str = "fhn_data.h5", verbose: bool = True):
+    """Generate n_samples FHN trajectories and save them to HDF5."""
     if backend == "fallback":
-        solver = FDBackend(
-            config.nx,
-            config.ny,
-            dx=1.0 / config.nx,
-            dy=1.0 / config.ny if config.ny else 1.0,
-        )
+        solver = FDBackend(config.nx, config.ny, dx=1.0/config.nx,
+                          dy=1.0/config.ny if config.ny else 1.0)
     elif backend == "dedalus":
         solver = DedalusBackend(config.nx, config.ny)
     else:
@@ -343,67 +398,60 @@ def generate_dataset(
     all_params = []
     all_I_ext = []
 
-    iterator = (
-        tqdm(range(n_samples), desc="Generating samples")
-        if verbose
-        else range(n_samples)
-    )
+    iterator = tqdm(range(n_samples), desc="Generating samples") if verbose else range(n_samples)
 
     for i in iterator:
-        u0, v0 = sample_initial_conditions(
-            config.nx, config.ny, config.ic_type, config.grf_alpha, seed=i
-        )
+        u0, v0 = sample_initial_conditions(config.nx, config.ny, config.ic_type,
+                                          config.grf_alpha, seed=i)
 
-        params = sample_parameters(config, seed=i * 100)
+        params = sample_parameters(config, seed=i*100)
 
         I_ext = None
         if config.use_stimulus:
-            if config.ny is None:
+            if config.ny is None:  # 1D
                 I_ext = config.stimulus_amplitude * np.random.randn(config.nx)
-            else:
-                I_ext = config.stimulus_amplitude * np.random.randn(
-                    config.nx, config.ny
-                )
+            else:  # 2D
+                I_ext = config.stimulus_amplitude * np.random.randn(config.nx, config.ny)
 
         if config.noise_std > 0:
             u0 += config.noise_std * np.random.randn(*u0.shape)
             v0 += config.noise_std * np.random.randn(*v0.shape)
 
-        sol = solver.solve(
-            u0, v0, params, config.T, config.dt, config.n_timesteps, I_ext
-        )
+
+        sol = solver.solve(u0, v0, params, config.T, config.dt, config.n_timesteps, I_ext)
 
         all_u0.append(u0)
         all_v0.append(v0)
-        all_u_traj.append(sol["u"])
-        all_v_traj.append(sol["v"])
+        all_u_traj.append(sol['u'])
+        all_v_traj.append(sol['v'])
         all_params.append([params.Du, params.Dv, params.a, params.b, params.tau])
         all_I_ext.append(I_ext if I_ext is not None else np.zeros_like(u0))
 
-    with h5py.File(output_file, "w") as f:
-        f.create_dataset("u0", data=np.array(all_u0))
-        f.create_dataset("v0", data=np.array(all_v0))
-        f.create_dataset("u_traj", data=np.array(all_u_traj))
-        f.create_dataset("v_traj", data=np.array(all_v_traj))
-        f.create_dataset("params", data=np.array(all_params))
-        f.create_dataset("I_ext", data=np.array(all_I_ext))
-        f.create_dataset("times", data=sol["t"])
+    with h5py.File(output_file, 'w') as f:
+        f.create_dataset('u0', data=np.array(all_u0))
+        f.create_dataset('v0', data=np.array(all_v0))
+        f.create_dataset('u_traj', data=np.array(all_u_traj))
+        f.create_dataset('v_traj', data=np.array(all_v_traj))
+        f.create_dataset('params', data=np.array(all_params))
+        f.create_dataset('I_ext', data=np.array(all_I_ext))
+        f.create_dataset('times', data=sol['t'])
 
 
 def main():
+    # edit these directly, no CLI args
     BACKEND = "fallback"
     DIM = 1
-    N_SAMPLES = 8000
+    N_SAMPLES = 128
     NX = 256
-    NY = None
+    NY = None  # set for 2D
     T = 1.0
     DT = 0.01
     N_TIMESTEPS = 50
     IC_TYPE = "grf"
     USE_STIMULUS = False
-    OUTPUT_FILE = "data/fhn_1d_stim.h5"
+    OUTPUT_FILE = "data/fhn_1d_128.h5"
     SEED = 42
-
+    
     config = DataConfig(
         dim=DIM,
         nx=NX,
@@ -412,26 +460,25 @@ def main():
         dt=DT,
         n_timesteps=N_TIMESTEPS,
         ic_type=IC_TYPE,
-        use_stimulus=USE_STIMULUS,
+        use_stimulus=USE_STIMULUS
     )
-
+    
     np.random.seed(SEED)
-
+    
     print(f"Generating {N_SAMPLES} samples...")
     print(f"Configuration: {DIM}D, nx={NX}, T={T}, backend={BACKEND}")
 
     import os
-
     os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
-
+    
     generate_dataset(
         config=config,
         n_samples=N_SAMPLES,
         backend=BACKEND,
         output_file=OUTPUT_FILE,
-        verbose=True,
+        verbose=True
     )
-
+    
     print(f"Dataset saved to {OUTPUT_FILE}")
 
 
